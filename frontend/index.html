@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowSense</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--ink:#16242b;--mute:#5b6b73;--line:#d9e0e4;--bg:#eef1f3;--panel:#fff;--accent:#24508f}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg);height:100vh;display:grid;grid-template-rows:auto 1fr}
+.banner{background:#ffe9a8;color:#4a3600;padding:6px 14px;font-weight:600;font-size:13px}
+.app{display:grid;grid-template-columns:400px 1fr;min-height:0}
+aside{background:var(--panel);overflow-y:auto;padding:14px;border-right:1px solid var(--line)}
+#map{min-height:300px}
+h1{font-size:22px;margin:0 0 2px}h2{font-size:16px;margin:18px 0 8px}
+.sub{color:var(--mute);font-size:13px;margin:0 0 12px}
+label{display:block;font-size:13px;color:var(--mute);margin:8px 0 3px}
+select,button{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;width:100%}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent);margin-top:10px;cursor:pointer;font-weight:600}
+button:focus-visible,select:focus-visible,.loc:focus-visible{outline:3px solid #7aa7e6;outline-offset:1px}
+.loc{display:flex;justify-content:space-between;align-items:center;width:100%;text-align:left;margin-bottom:6px;cursor:pointer}
+.loc.sel{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.badge{font-size:12px;font-weight:700;padding:2px 8px;border-radius:10px;color:#fff;white-space:nowrap}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px}
+.row{display:flex;justify-content:space-between;gap:8px;padding:3px 0;font-size:14px}
+.row span:first-child{color:var(--mute)}
+.note{font-size:12px;color:var(--mute);margin-top:6px}
+.warn{font-size:12px;color:#8a4b00;margin-top:4px}
+.err{color:#a02020;font-size:13px;margin-top:8px}
+.legend{position:absolute;z-index:500;right:10px;bottom:22px;background:#fff;padding:8px 10px;border-radius:6px;font-size:12px;box-shadow:0 1px 4px #0003}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.mapwrap{position:relative;min-height:0}
+@media(max-width:800px){body{height:auto}.app{grid-template-columns:1fr}.mapwrap{order:-1;height:45vh}aside{border-right:0}}
+@media(prefers-reduced-motion:no-preference){.card{transition:border-color .2s}}
+</style>
+</head>
+<body>
+<div class="banner" role="status">SIMULATED DATA — demo scenarios only. Not live phone, Wi-Fi or traffic counts.</div>
+<div class="app">
+<aside>
+  <h1>FlowSense</h1>
+  <p class="sub">Crowd level, waiting time and route options for Kolkata (demo).</p>
+  <label for="scenario">Demo scenario</label>
+  <select id="scenario"></select>
+
+  <h2>Locations</h2>
+  <div id="list">Loading…</div>
+  <div id="detail"></div>
+
+  <h2>Plan a journey</h2>
+  <label for="origin">From</label><select id="origin"></select>
+  <label for="dest">To</label><select id="dest"></select>
+  <button class="primary" id="go">Compare routes</button>
+  <label for="sort">Sort routes by</label>
+  <select id="sort"><option value="current_duration_s">Fastest</option><option value="delay_minutes">Least delay</option><option value="distance_m">Shortest distance</option></select>
+  <div id="routes"></div>
+  <p class="note">Estimates are informational and may be inaccurate. No personal data or device IDs are collected. Map © OpenStreetMap contributors.</p>
+</aside>
+<div class="mapwrap"><div id="map"></div>
+  <div class="legend" aria-label="Activity legend"><b>Activity</b><br>
+  <i style="background:#2e9e6b"></i>Very low<br><i style="background:#8cbf3f"></i>Low<br><i style="background:#e0b020"></i>Moderate<br><i style="background:#e67e22"></i>High<br><i style="background:#c0392b"></i>Very high</div>
+</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const API = '/api/v1';
+const COLORS = {'Very low':'#2e9e6b','Low':'#8cbf3f','Moderate':'#e0b020','High':'#e67e22','Very high':'#c0392b'};
+const TREND = {rising:'▲ Rising',falling:'▼ Falling',stable:'► Stable',unknown:'? Unknown'};
+const $ = id => document.getElementById(id);
+let locs = [], selected = null, circles = {}, routeLayer = null, lastRoutes = [];
+
+const map = L.map('map').setView([22.55, 88.355], 11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 18, attribution: '© OpenStreetMap contributors'}).addTo(map);
+
+const scenario = () => $('scenario').value;
+const badge = l => `<span class="badge" style="background:${COLORS[l.activity_label]}">${l.activity_label} ${Math.round(l.activity_index)}</span>`;
+async function api(path, opts) {
+  const r = await fetch(API + path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || 'Request failed (' + r.status + ')');
+  return r.json();
+}
+
+function spark(h) {
+  const w = 340, ht = 60, pts = h.map((v, i) => `${(i / (h.length - 1) * w).toFixed(1)},${(ht - v / 100 * ht).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 ${w} ${ht}" width="100%" height="60" role="img" aria-label="Activity over the last 30 minutes"><polyline points="${pts}" fill="none" stroke="#24508f" stroke-width="2"/></svg>`;
+}
+
+function renderList() {
+  $('list').innerHTML = locs.map(l => `<button class="loc ${l.location_id === selected ? 'sel' : ''}" data-id="${l.location_id}"><span>${l.name}</span>${badge(l)}</button>`).join('');
+  $('list').querySelectorAll('.loc').forEach(b => b.onclick = () => select(b.dataset.id));
+}
+
+function renderMap() {
+  locs.forEach(l => {
+    const style = {color: COLORS[l.activity_label], fillColor: COLORS[l.activity_label], fillOpacity: .35, weight: 2};
+    if (circles[l.location_id]) circles[l.location_id].setStyle(style);
+    else {
+      circles[l.location_id] = L.circle([l.lat, l.lon], {radius: l.radius_m, ...style}).addTo(map).on('click', () => select(l.location_id));
+    }
+    circles[l.location_id].bindTooltip(`${l.name}: ${l.activity_label} (${TREND[l.trend]})`);
+  });
+}
+
+function renderDetail() {
+  const l = locs.find(x => x.location_id === selected);
+  if (!l) { $('detail').innerHTML = ''; return; }
+  const w = l.wait_estimate_minutes;
+  $('detail').innerHTML = `<div class="card"><b>${l.name}</b> <span class="note">(${l.category.replace('_', ' ')})</span>
+    <div class="row"><span>Activity</span><span>${badge(l)}</span></div>
+    <div class="row"><span>Trend</span><span>${TREND[l.trend]}${l.trend_delta !== null ? ' (' + (l.trend_delta > 0 ? '+' : '') + l.trend_delta + ')' : ''}</span></div>
+    <div class="row"><span>Estimated wait</span><span>${w ? w.low + '–' + w.high + ' min' : 'Not available'}</span></div>
+    <div class="row"><span>People estimate</span><span>Not calibrated</span></div>
+    <div class="row"><span>Confidence</span><span>${l.confidence}</span></div>
+    <div class="row"><span>Source</span><span>${l.source_label}</span></div>
+    <div class="row"><span>Updated</span><span>${new Date(l.observed_at).toLocaleTimeString()}</span></div>
+    ${spark(l.history)}<div class="note">Activity, last 30 min (0–100)</div>
+    ${w ? `<div class="note">Basis: ${w.basis}. Crowd level is not the same as queue wait.</div>` : ''}
+    ${l.limitations.map(t => `<div class="warn">• ${t}</div>`).join('')}</div>`;
+}
+
+function select(id) { selected = id; renderList(); renderDetail(); const l = locs.find(x => x.location_id === id); if (l) map.panTo([l.lat, l.lon]); }
+
+async function load() {
+  try {
+    locs = await api('/locations?scenario=' + scenario());
+    renderList(); renderMap(); renderDetail();
+  } catch (e) { $('list').innerHTML = `<div class="err">Could not load locations: ${e.message}</div>`; }
+}
+
+function renderRoutes() {
+  const key = $('sort').value;
+  const rs = [...lastRoutes].sort((a, b) => (key === 'current_duration_s' ? a.current_duration_s - b.current_duration_s : a[key] - b[key]));
+  $('routes').innerHTML = rs.map((r, i) => `<div class="card"><b>${r.label}</b> ${i === 0 ? '<span class="note">(first in sort)</span>' : ''}
+    <div class="row"><span>Duration</span><span><b>${Math.round(r.current_duration_s / 60)} min</b> (usual ${Math.round(r.baseline_duration_s / 60)})</span></div>
+    <div class="row"><span>Distance</span><span>${(r.distance_m / 1000).toFixed(1)} km</span></div>
+    <div class="row"><span>Delay</span><span>${r.delay_minutes} min slower than usual</span></div>
+    <div class="row"><span>Delay score</span><span>${r.delay_score}/100</span></div>
+    <div class="row"><span>Crowd on route</span><span>${r.crowd.mean_activity === null ? 'Unknown' : r.crowd.label + ' (' + r.crowd.mean_activity + ')'}</span></div>
+    <div class="row"><span>Data coverage</span><span>${r.crowd.coverage_pct}%</span></div>
+    <div class="row"><span>Confidence</span><span>${r.confidence}</span></div>
+    ${r.warnings.map(t => `<div class="warn">⚠ ${t}</div>`).join('')}
+    <button class="show" data-i="${lastRoutes.indexOf(r)}" style="margin-top:8px">Show on map</button></div>`).join('')
+    + '<p class="note">Delay score = relative delay severity, not the chance of being late. Source: simulated demo routes.</p>';
+  $('routes').querySelectorAll('.show').forEach(b => b.onclick = () => {
+    if (routeLayer) map.removeLayer(routeLayer);
+    routeLayer = L.polyline(lastRoutes[b.dataset.i].geometry, {color: '#24508f', weight: 5}).addTo(map);
+    map.fitBounds(routeLayer.getBounds(), {padding: [30, 30]});
+  });
+}
+
+$('go').onclick = async () => {
+  const o = locs.find(l => l.location_id === $('origin').value), d = locs.find(l => l.location_id === $('dest').value);
+  $('routes').innerHTML = 'Loading…';
+  try {
+    const body = {origin: {lat: o.lat, lon: o.lon, label: o.name}, destination: {lat: d.lat, lon: d.lon, label: d.name}, scenario: scenario()};
+    const res = await api('/routes/alternatives', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    lastRoutes = res.routes; renderRoutes();
+    if (routeLayer) map.removeLayer(routeLayer);
+    routeLayer = L.polyline(lastRoutes[0].geometry, {color: '#24508f', weight: 5}).addTo(map);
+    map.fitBounds(routeLayer.getBounds(), {padding: [30, 30]});
+  } catch (e) { $('routes').innerHTML = `<div class="err">${e.message}</div>`; }
+};
+$('sort').onchange = () => lastRoutes.length && renderRoutes();
+$('scenario').onchange = load;
+
+(async function init() {
+  const sc = await api('/scenarios');
+  $('scenario').innerHTML = sc.map(s => `<option value="${s.id}">${s.label}</option>`).join('');
+  await load();
+  const opts = locs.map(l => `<option value="${l.location_id}">${l.name}</option>`).join('');
+  $('origin').innerHTML = opts; $('dest').innerHTML = opts; $('dest').selectedIndex = 2;
+  setInterval(load, 30000);
+})();
+</script>
+</body>
+</html>
